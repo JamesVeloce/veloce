@@ -1,112 +1,124 @@
 import { NextResponse } from 'next/server';
+import Stripe from 'stripe';
 import { createClient } from '@supabase/supabase-js';
 import { Resend } from 'resend';
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY!
-);
+export const runtime = 'nodejs';
 
-const resend = new Resend(process.env.RESEND_API_KEY!);
+// Lazy initialization helpers to prevent build-time environment variable errors
+function getStripe() {
+  const secretKey = process.env.STRIPE_SECRET_KEY;
+  if (!secretKey) throw new Error('Missing STRIPE_SECRET_KEY');
+  return new Stripe(secretKey, { apiVersion: '2023-10-16' });
+}
+
+function getSupabaseAdmin() {
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) throw new Error('Missing Supabase environment variables');
+  return createClient(url, key);
+}
+
+function getResend() {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) throw new Error('Missing RESEND_API_KEY');
+  return new Resend(apiKey);
+}
 
 export async function POST(req: Request) {
+  const body = await req.text();
+  const signature = req.headers.get('stripe-signature');
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  const stripe = getStripe();
+  const supabase = getSupabaseAdmin();
+  const resend = getResend();
+
+  let event: Stripe.Event;
+
   try {
-    const body = await req.json();
-    const eventType = body.type;
-    const eventData = body.data?.object;
-
-    if (!eventData) {
-      return NextResponse.json({ error: 'Invalid payload structure' }, { status: 400 });
+    if (webhookSecret && signature) {
+      event = stripe.webhooks.constructEvent(body, signature, webhookSecret);
+    } else {
+      event = JSON.parse(body) as Stripe.Event;
     }
+  } catch (err: any) {
+    console.error(`Webhook signature verification failed: ${err.message}`);
+    return NextResponse.json({ error: `Webhook Error: ${err.message}` }, { status: 400 });
+  }
 
-    // 1. HANDLE PAYMENT FAILURE (DUNNING INITIALIZATION)
-    if (eventType === 'invoice.payment_failed') {
-      const { id: invoiceId, customer_email, customer_name, amount_due, currency, hosted_invoice_url } = eventData;
+  try {
+    switch (event.type) {
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object as Stripe.Invoice;
+        const customerId = invoice.customer as string;
+        const customerEmail = invoice.customer_email;
+        const hostedInvoiceUrl = invoice.hosted_invoice_url;
 
-      // Upsert customer
-      const { data: customer, error: customerErr } = await supabase
-        .from('customers')
-        .upsert(
-          { email: customer_email, name: customer_name || 'Valued Customer' },
-          { onConflict: 'email' }
-        )
-        .select()
-        .single();
+        // 1. Log payment failure to Supabase
+        const { error: dbError } = await supabase
+          .from('dunning_logs')
+          .insert({
+            stripe_customer_id: customerId,
+            customer_email: customerEmail,
+            amount_due: invoice.amount_due,
+            status: 'failed',
+            attempt_count: invoice.attempt_count,
+            created_at: new Date().toISOString(),
+          });
 
-      if (customerErr) throw customerErr;
+        if (dbError) {
+          console.error('Supabase logging error:', dbError);
+        }
 
-      // Upsert failed invoice
-      const { data: invoice, error: invoiceErr } = await supabase
-        .from('failed_invoices')
-        .upsert(
-          {
-            customer_id: customer.id,
-            stripe_invoice_id: invoiceId,
-            amount_due_cents: amount_due,
-            currency: currency || 'usd',
-            status: 'recovering',
-            current_step: 1,
-            hosted_invoice_url: hosted_invoice_url,
-          },
-          { onConflict: 'stripe_invoice_id' }
-        )
-        .select()
-        .single();
-
-      if (invoiceErr) throw invoiceErr;
-
-      // Dispatch Dunning Email via Resend Sandbox
-      const formattedAmount = (amount_due / 100).toFixed(2);
-      await resend.emails.send({
-        from: 'onboarding@resend.dev',
-        to: customer_email,
-        subject: `Action Required: Payment failed ($${formattedAmount})`,
-        html: `<p>Hi ${customer.name},</p>
-               <p>We couldn't process your payment of <strong>$${formattedAmount}</strong>.</p>
-               <p><a href="${hosted_invoice_url}">Click here to update your payment method.</a></p>`,
-      });
-
-      // Log activity
-      await supabase.from('recovery_logs').insert({
-        invoice_id: invoice.id,
-        event_type: 'payment_failed',
-        details: `Payment of $${formattedAmount} failed. Dunning sequence initialized.`,
-      });
-
-      console.log(`Successfully queued invoice ${invoiceId} for dunning recovery.`);
-      return NextResponse.json({ status: 'success', message: 'Invoice queued for dunning recovery.' }, { status: 200 });
-    }
-
-    // 2. HANDLE PAYMENT SUCCESS (RECOVERY COMPLETED)
-    if (eventType === 'invoice.payment_succeeded') {
-      const { id: invoiceId, amount_paid } = eventData;
-
-      // Mark invoice as recovered
-      const { data: invoice } = await supabase
-        .from('failed_invoices')
-        .update({ status: 'recovered' })
-        .eq('stripe_invoice_id', invoiceId)
-        .select()
-        .single();
-
-      if (invoice) {
-        const formattedAmount = (amount_paid / 100).toFixed(2);
-
-        // Log recovery success
-        await supabase.from('recovery_logs').insert({
-          invoice_id: invoice.id,
-          event_type: 'payment_recovered',
-          details: `Payment of $${formattedAmount} successfully recovered!`,
-        });
+        // 2. Trigger automated dunning recovery email via Resend
+        if (customerEmail && hostedInvoiceUrl) {
+          await resend.emails.send({
+            from: 'Veloce Dunning <billing@veloce.app>',
+            to: customerEmail,
+            subject: 'Action Required: Payment failed for your subscription',
+            html: `
+              <div style="font-family: sans-serif; padding: 20px;">
+                <h2>Payment Failed</h2>
+                <p>We were unable to process your payment of $${(invoice.amount_due / 100).toFixed(2)}.</p>
+                <p>Please update your payment details to keep your subscription active:</p>
+                <p><a href="${hostedInvoiceUrl}" style="background: #000; color: #fff; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block;">Update Payment Method</a></p>
+              </div>
+            `,
+          });
+        }
+        break;
       }
 
-      console.log(`Successfully marked invoice ${invoiceId} as recovered.`);
-      return NextResponse.json({ status: 'success', message: 'Invoice marked as recovered.' }, { status: 200 });
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object as Stripe.Subscription;
+        await supabase
+          .from('subscriptions')
+          .upsert({
+            stripe_subscription_id: subscription.id,
+            stripe_customer_id: subscription.customer as string,
+            status: subscription.status,
+            updated_at: new Date().toISOString(),
+          });
+        break;
+      }
+
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object as Stripe.Subscription;
+        await supabase
+          .from('subscriptions')
+          .update({ status: 'canceled', updated_at: new Date().toISOString() })
+          .eq('stripe_subscription_id', subscription.id);
+        break;
+      }
+
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
     }
 
-    return NextResponse.json({ status: 'ignored', message: 'Unhandled event type.' }, { status: 200 });
-  } catch (err: any) {
-    console.error('Webhook Error:', err.message);
-    return NextResponse.json({ error: err.message }, { status: 500 });
+    return NextResponse.json({ received: true });
+  } catch (error: any) {
+    console.error('Webhook execution error:', error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
